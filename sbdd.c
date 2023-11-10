@@ -34,11 +34,15 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+
+	struct block_device	*bd1;
 };
 
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
+
+static char*		__sbdd_disk1 = NULL;
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
@@ -62,7 +66,7 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 
 	spin_unlock(&__sbdd.datalock);
 
-	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
+	pr_debug("pos=%6llu len=%4llu nbytes=%4lu %s\n", pos, len, nbytes, dir ? "written" : "read");
 
 	return len;
 }
@@ -88,6 +92,20 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 
 	atomic_inc(&__sbdd.refs_cnt);
 
+	if (__sbdd.bd1 && bio_data_dir(bio)) {
+		struct bio *bio_clone;
+		pr_info("%s: cloning bio write\n", __func__);
+		bio_clone = bio_clone_fast(bio, GFP_KERNEL|GFP_NOIO|GFP_NOFS, &q->bio_split);
+
+		if (bio_clone) {
+			bio_set_dev(bio_clone, __sbdd.bd1);
+			submit_bio(bio_clone);
+		} else {
+			pr_err("FAILED to clone bio...\n");
+			bio_io_error(bio);
+		}
+	}
+
 	sbdd_xfer_bio(bio);
 	bio_endio(bio);
 
@@ -104,6 +122,24 @@ the request() function associated with the request queue of the disk.
 static struct block_device_operations const __sbdd_bdev_ops = {
 	.owner = THIS_MODULE,
 };
+
+static int inline sbdd_attach_disk(const char* path, struct block_device **bd)
+{
+	int ret = 0;
+
+	pr_info("attaching blkdev disk %s\n", path);
+	*bd = blkdev_get_by_path(path, FMODE_READ|FMODE_WRITE|FMODE_EXCL|FMODE_NDELAY, &__sbdd);
+
+	if (IS_ERR(*bd)) {
+		ret = PTR_ERR(*bd);
+		pr_warn("blkdev %s attach failed: %d\n", path, ret);
+		*bd = NULL;
+	} else {
+		pr_info("blkdev attach complete");
+	}
+
+	return ret;
+}
 
 static int sbdd_create(void)
 {
@@ -122,6 +158,22 @@ static int sbdd_create(void)
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
 	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
+
+	// attach 'physical' disk
+	if (__sbdd_disk1) {
+		sector_t bdcap;
+
+		ret = sbdd_attach_disk(__sbdd_disk1, &__sbdd.bd1);
+		if (ret)
+			return ret;
+
+		// limit capacity of ramdisk to capacity of physical
+		bdcap = get_capacity(__sbdd.bd1->bd_disk);
+		if (bdcap < __sbdd.capacity) {
+			pr_info("old capacity=%llu, new capacity=%llu\n", __sbdd.capacity, bdcap);
+			__sbdd.capacity = bdcap;
+		}
+	}
 
 	pr_info("allocating data\n");
 	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
@@ -173,6 +225,12 @@ static void sbdd_delete(void)
 	atomic_set(&__sbdd.deleting, 1);
 
 	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
+
+	if (__sbdd.bd1) {
+		pr_info("releasing phys disk 1");
+		blkdev_put(__sbdd.bd1, FMODE_READ|FMODE_WRITE|FMODE_EXCL|FMODE_NDELAY);
+		__sbdd.bd1 = NULL;
+	}
 
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
@@ -232,6 +290,12 @@ directly into the kernel). There is also __exitdata note.
 static void __exit sbdd_exit(void)
 {
 	pr_info("exiting...\n");
+	if (__sbdd.bd1) {
+		blkdev_put(__sbdd.bd1, FMODE_READ|FMODE_WRITE|FMODE_EXCL|FMODE_NDELAY);
+		__sbdd.bd1 = NULL;
+		pr_info("detached blkdev 1\n");
+	}
+
 	sbdd_delete();
 	pr_info("exiting complete\n");
 }
@@ -244,6 +308,7 @@ module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+module_param_named(disk1, __sbdd_disk1, charp, S_IRUGO);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");

@@ -32,6 +32,6 @@
 ######## Kbuild
 
 ccflags-y := -Wall
-# CFLAGS_sbdd.o := -DDEBUG
+CFLAGS_sbdd.o := -DDEBUG
 
 obj-m := sbdd.o
