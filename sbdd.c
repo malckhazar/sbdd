@@ -25,65 +25,39 @@
 #define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME              "sbdd"
 
+#define SBDD_DRIVES_COUNT      2
+
 struct sbdd {
 	wait_queue_head_t       exitwait;
 	spinlock_t              datalock;
 	atomic_t                deleting;
 	atomic_t                refs_cnt;
 	sector_t                capacity;
-	u8                      *data;
+	int			stripe;	// in sectors
 	struct gendisk          *gd;
 	struct request_queue    *q;
 
-	struct block_device	*bd1;
+	struct block_device	*bd[2];
 };
 
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
 
+enum {
+	RAID_0 = 0,
+	RAID_1 = 1,
+};
+
+static unsigned short	__sbdd_mode = RAID_1;
+static int		__sbdd_stripe = PAGE_SIZE;
+
 static char*		__sbdd_disk1 = NULL;
-
-static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
-{
-	void *buff = page_address(bvec->bv_page) + bvec->bv_offset;
-	sector_t len = bvec->bv_len >> SBDD_SECTOR_SHIFT;
-	size_t offset;
-	size_t nbytes;
-
-	if (pos + len > __sbdd.capacity)
-		len = __sbdd.capacity - pos;
-
-	offset = pos << SBDD_SECTOR_SHIFT;
-	nbytes = len << SBDD_SECTOR_SHIFT;
-
-	spin_lock(&__sbdd.datalock);
-
-	if (dir)
-		memcpy(__sbdd.data + offset, buff, nbytes);
-	else
-		memcpy(buff, __sbdd.data + offset, nbytes);
-
-	spin_unlock(&__sbdd.datalock);
-
-	pr_debug("pos=%6llu len=%4llu nbytes=%4lu %s\n", pos, len, nbytes, dir ? "written" : "read");
-
-	return len;
-}
-
-static void sbdd_xfer_bio(struct bio *bio)
-{
-	struct bvec_iter iter;
-	struct bio_vec bvec;
-	int dir = bio_data_dir(bio);
-	sector_t pos = bio->bi_iter.bi_sector;
-
-	bio_for_each_segment(bvec, bio, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
-}
+static char*		__sbdd_disk2 = NULL;
 
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 {
+	struct bio *bio2 = NULL;
 	if (atomic_read(&__sbdd.deleting)) {
 		pr_err("unable to process bio while deleting\n");
 		bio_io_error(bio);
@@ -92,23 +66,25 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 
 	atomic_inc(&__sbdd.refs_cnt);
 
-	if (__sbdd.bd1 && bio_data_dir(bio)) {
-		struct bio *bio_clone;
-		pr_info("%s: cloning bio write\n", __func__);
-		bio_clone = bio_clone_fast(bio, GFP_KERNEL|GFP_NOIO|GFP_NOFS, &q->bio_split);
+	switch(__sbdd_mode) {
+	case RAID_1:
+		bio2 = bio_clone_fast(bio, GFP_NOIO, &q->bio_split);
 
-		if (bio_clone) {
-			bio_set_dev(bio_clone, __sbdd.bd1);
-			submit_bio(bio_clone);
-		} else {
-			pr_err("FAILED to clone bio...\n");
-			bio_io_error(bio);
-		}
+		bio_set_dev(bio2, __sbdd.bd[1]);
+		bio_chain(bio2, bio);
+		submit_bio(bio2);
+
+		bio_set_dev(bio, __sbdd.bd[0]);
+		submit_bio(bio);
+
+		break;
+
+	default:
+		pr_err("unknown RAID mode %d\n", __sbdd_mode);
+		bio_io_error(bio);
 	}
 
-	sbdd_xfer_bio(bio);
-	bio_endio(bio);
-
+	pr_info("bio done =====================\n");
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
 		wake_up(&__sbdd.exitwait);
 
@@ -157,30 +133,32 @@ static int sbdd_create(void)
 	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
-	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
 
 	// attach 'physical' disk
 	if (__sbdd_disk1) {
-		sector_t bdcap;
-
-		ret = sbdd_attach_disk(__sbdd_disk1, &__sbdd.bd1);
+		ret = sbdd_attach_disk(__sbdd_disk1, &__sbdd.bd[0]);
 		if (ret)
 			return ret;
 
-		// limit capacity of ramdisk to capacity of physical
-		bdcap = get_capacity(__sbdd.bd1->bd_disk);
-		if (bdcap < __sbdd.capacity) {
-			pr_info("old capacity=%llu, new capacity=%llu\n", __sbdd.capacity, bdcap);
-			__sbdd.capacity = bdcap;
-		}
+		__sbdd.capacity = get_capacity(__sbdd.bd[0]->bd_disk);
 	}
 
-	pr_info("allocating data\n");
-	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
-	if (!__sbdd.data) {
-		pr_err("unable to alloc data\n");
-		return -ENOMEM;
+	// attach second 'physical' disk
+	if (__sbdd_disk2) {
+		sector_t capacity;
+
+		ret = sbdd_attach_disk(__sbdd_disk2, &__sbdd.bd[1]);
+		if (ret)
+			return ret;
+
+		// limit capacity
+		capacity = get_capacity(__sbdd.bd[1]->bd_disk);
+
+		if (capacity < __sbdd.capacity)
+			__sbdd.capacity = capacity;
 	}
+
+	__sbdd.stripe = __sbdd_stripe >> SECTOR_SHIFT;
 
 	spin_lock_init(&__sbdd.datalock);
 	init_waitqueue_head(&__sbdd.exitwait);
@@ -222,14 +200,17 @@ static int sbdd_create(void)
 
 static void sbdd_delete(void)
 {
+	int i;
 	atomic_set(&__sbdd.deleting, 1);
 
 	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
 
-	if (__sbdd.bd1) {
-		pr_info("releasing phys disk 1");
-		blkdev_put(__sbdd.bd1, FMODE_READ|FMODE_WRITE|FMODE_EXCL|FMODE_NDELAY);
-		__sbdd.bd1 = NULL;
+	for(i = 0; i < SBDD_DRIVES_COUNT; i++) {
+		if (__sbdd.bd[i]) {
+			pr_info("releasing phys disk %i\n", i);
+			blkdev_put(__sbdd.bd[i], FMODE_READ|FMODE_WRITE|FMODE_EXCL|FMODE_NDELAY);
+			__sbdd.bd[i] = NULL;
+		}
 	}
 
 	/* gd will be removed only after the last reference put */
@@ -245,11 +226,6 @@ static void sbdd_delete(void)
 
 	if (__sbdd.gd)
 		put_disk(__sbdd.gd);
-
-	if (__sbdd.data) {
-		pr_info("freeing data\n");
-		vfree(__sbdd.data);
-	}
 
 	memset(&__sbdd, 0, sizeof(struct sbdd));
 
@@ -270,6 +246,22 @@ static int __init sbdd_init(void)
 	int ret = 0;
 
 	pr_info("starting initialization...\n");
+
+	if (__sbdd_mode > 1) {
+		pr_err("supported RAID modes are 0 and 1\n");
+		return -EINVAL;
+	}
+
+	if (!__sbdd_disk1 || !__sbdd_disk2) {
+		pr_err("2 disks are required!\n");
+		return -EINVAL;
+	}
+
+	if ((__sbdd_stripe < 0) || (__sbdd_stripe & (SECTOR_SIZE - 1))) {
+		pr_err("stripe should be positive and dividable by %d\n", SECTOR_SIZE);
+		return -EINVAL;
+	}
+
 	ret = sbdd_create();
 
 	if (ret) {
@@ -289,11 +281,14 @@ directly into the kernel). There is also __exitdata note.
 */
 static void __exit sbdd_exit(void)
 {
+	int i;
 	pr_info("exiting...\n");
-	if (__sbdd.bd1) {
-		blkdev_put(__sbdd.bd1, FMODE_READ|FMODE_WRITE|FMODE_EXCL|FMODE_NDELAY);
-		__sbdd.bd1 = NULL;
-		pr_info("detached blkdev 1\n");
+	for (i = 0; i < SBDD_DRIVES_COUNT; i++) {
+		if (__sbdd.bd[i]) {
+			blkdev_put(__sbdd.bd[i], FMODE_READ|FMODE_WRITE|FMODE_EXCL|FMODE_NDELAY);
+			__sbdd.bd[i] = NULL;
+			pr_info("detached blkdev 1\n");
+		}
 	}
 
 	sbdd_delete();
@@ -308,8 +303,13 @@ module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+module_param_named(mode, __sbdd_mode, ushort, S_IRUGO);
 module_param_named(disk1, __sbdd_disk1, charp, S_IRUGO);
+module_param_named(disk2, __sbdd_disk2, charp, S_IRUGO);
+module_param_named(stripe, __sbdd_stripe, int, S_IRUGO);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Simple Block Device Driver");
+
+
